@@ -62,6 +62,8 @@ If a client cannot send headers, use `https://agent-handoff-hub-production.up.ra
 
 ### Runner options
 
+A run is reported as **failed**, not done, when Claude hit tool calls it was not allowed to make, left uncommitted changes, or made commits it did not push; the result says which. Finished worktrees stay on disk; remove them with `git worktree remove <path>` (or `git worktree prune` after deleting the folder).
+
 While the runner is running, `agents_status` reports Claude as available. Environment variables override `runner.env`.
 
 | Runner env | Default | |
@@ -71,9 +73,10 @@ While the runner is running, `agents_status` reports Claude as available. Enviro
 | `HANDOFF_ON_LIMIT` | `devin` | `requeue` keeps the task queued for Claude instead. |
 | `HANDOFF_LIMIT_COOLDOWN_MINUTES` | `60` | |
 | `HANDOFF_TIMEOUT_MINUTES` | `60` | Per task. |
-| `HANDOFF_CLAUDE_ARGS` | `--permission-mode acceptEdits` | Extra flags for `claude -p` (e.g. `--allowedTools ...`). |
+| `HANDOFF_CLAUDE_ARGS` | `--permission-mode bypassPermissions` | Flags for `claude -p`. Headless runs have nobody to approve tool calls, so by default Claude can run any command (git, gh, tests) inside the task's worktree. For a tighter leash use e.g. `--permission-mode acceptEdits --allowedTools Bash(git:*) Bash(gh:*) Bash(npm:*)`; any denied call fails the handoff. |
+| `HANDOFF_CODEX_ARGS` | `--sandbox danger-full-access` | Flags for `codex exec` (network is needed to push). |
 | `HANDOFF_REPOS` / `HANDOFF_REPO_MAP` | | JSON map (or path to a JSON file) of `owner/repo` → local path, e.g. `{"Quillhash/usepulse-fe":"/Users/me/code/usepulse-fe"}`. |
-| `HANDOFF_WORKSPACE` | `~/agent-handoff-workspace` | Where repos without a mapping are cloned. |
+| `HANDOFF_WORKSPACE` | `~/agent-handoff-workspace` | Where repos without a mapping are cloned, and where each repo handoff gets its own git worktree (`worktrees/<owner>__<repo>__<id>`) on the handoff's branch or `handoff/<id>`. Your own checkout is never modified. |
 | `HANDOFF_ENV_FILE` | `~/.config/agent-handoff/runner.env` | |
 
 ## Try it
