@@ -30,7 +30,9 @@ const FALLBACK = env.HANDOFF_ON_LIMIT ?? "devin"; // devin | requeue
 const TIMEOUT_MS = Number(env.HANDOFF_TIMEOUT_MINUTES ?? 60) * 60_000;
 const CLAUDE_BIN = env.HANDOFF_CLAUDE_BIN ?? "claude";
 const CODEX_BIN = env.HANDOFF_CODEX_BIN ?? "codex";
-const CLAUDE_ARGS = (env.HANDOFF_CLAUDE_ARGS ?? "--permission-mode acceptEdits").split(" ").filter(Boolean);
+// Headless runs have nobody to approve tool calls, so by default Claude may run any command (git, gh, tests).
+const CLAUDE_ARGS = (env.HANDOFF_CLAUDE_ARGS ?? "--permission-mode bypassPermissions").split(" ").filter(Boolean);
+const CODEX_ARGS = (env.HANDOFF_CODEX_ARGS ?? "--sandbox danger-full-access").split(" ").filter(Boolean);
 const REPO_MAP: Record<string, string> = env.HANDOFF_REPO_MAP && existsSync(env.HANDOFF_REPO_MAP)
   ? JSON.parse(readFileSync(env.HANDOFF_REPO_MAP, "utf8"))
   : JSON.parse(env.HANDOFF_REPOS ?? "{}");
@@ -66,26 +68,68 @@ function run(cmd: string, args: string[], cwd: string, timeoutMs = TIMEOUT_MS): 
   });
 }
 
-/** Checkout the handoff's repo/branch: a mapped local clone, or a fresh clone under the workspace. */
-async function prepareWorkdir(h: Handoff): Promise<{ dir: string; note: string }> {
+interface Workdir { dir: string; note: string; branch?: string; baseSha?: string }
+
+const git = (dir: string, ...args: string[]) => run("git", args, dir, 5 * 60_000);
+
+async function defaultBase(clone: string): Promise<string> {
+  for (let i = 0; i < 2; i++) {
+    const r = await git(clone, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
+    if (r.code === 0) return r.stdout.trim();
+    await git(clone, "remote", "set-head", "origin", "--auto");
+  }
+  return "HEAD";
+}
+
+/**
+ * Each repo handoff gets its own git worktree and branch (the handoff's branch, or handoff/<id>), so the
+ * owner's checkout is never touched and the task can commit and push freely. Follow-ups reuse the worktree.
+ */
+async function prepareWorkdir(h: Handoff): Promise<Workdir> {
   mkdirSync(WORKSPACE, { recursive: true });
   if (!h.repo) return { dir: REPO_MAP["*"] ?? WORKSPACE, note: "" };
-  let dir = REPO_MAP[h.repo];
-  if (!dir) {
-    dir = path.join(WORKSPACE, h.repo.replace("/", "__"));
-    if (!existsSync(dir)) {
-      const r = await run("git", ["clone", `https://github.com/${h.repo}.git`, dir], WORKSPACE, 10 * 60_000);
-      if (r.code !== 0) throw new Error(`git clone ${h.repo} failed: ${r.stderr.slice(0, 300)}`);
-    }
+  const slug = h.repo.replace("/", "__");
+  const clone = REPO_MAP[h.repo] ?? path.join(WORKSPACE, slug);
+  if (!existsSync(clone)) {
+    const r = await run("git", ["clone", `https://github.com/${h.repo}.git`, clone], WORKSPACE, 10 * 60_000);
+    if (r.code !== 0) throw new Error(`git clone ${h.repo} failed: ${r.stderr.slice(0, 300)}`);
   }
-  if (!h.branch) return { dir, note: "" };
-  const dirty = (await run("git", ["status", "--porcelain"], dir)).stdout.trim();
-  if (dirty) return { dir, note: `Local clone ${dir} has uncommitted changes, so branch ${h.branch} was not checked out; check it out yourself if needed.` };
-  await run("git", ["fetch", "origin", h.branch], dir, 5 * 60_000);
-  const co = await run("git", ["checkout", h.branch], dir);
-  if (co.code !== 0) await run("git", ["checkout", "-b", h.branch], dir);
-  await run("git", ["pull", "--ff-only", "origin", h.branch], dir, 5 * 60_000);
-  return { dir, note: "" };
+  const dir = path.join(WORKSPACE, "worktrees", `${slug}__${h.id}`);
+  if (existsSync(dir)) {
+    const branch = (await git(dir, "rev-parse", "--abbrev-ref", "HEAD")).stdout.trim();
+    return { dir, note: "", branch, baseSha: (await git(dir, "rev-parse", "HEAD")).stdout.trim() };
+  }
+  const fetched = await git(clone, "fetch", "origin");
+  if (fetched.code !== 0) throw new Error(`git fetch in ${clone} failed: ${fetched.stderr.slice(0, 300)}`);
+  let branch = h.branch ?? `handoff/${h.id}`;
+  const onRemote = (await git(clone, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`)).code === 0;
+  const base = onRemote ? `origin/${branch}` : await defaultBase(clone);
+  let r = await git(clone, "worktree", "add", "-B", branch, dir, base);
+  if (r.code !== 0 && h.branch) {
+    branch = `handoff/${h.id}`; // e.g. the branch is checked out in the owner's own clone
+    r = await git(clone, "worktree", "add", "-B", branch, dir, base);
+  }
+  if (r.code !== 0) throw new Error(`git worktree add in ${clone} failed: ${r.stderr.slice(0, 300)}`);
+  const baseSha = (await git(dir, "rev-parse", "HEAD")).stdout.trim();
+  const note = [
+    `Your working directory is a dedicated git worktree (${dir}) on branch ${branch}, created from ${base}.`,
+    `Commit your changes there, push with \`git push -u origin ${branch}\`, and open a PR (e.g. \`gh pr create --fill\`) unless the task says otherwise.`,
+  ].join(" ");
+  return { dir, note, branch, baseSha };
+}
+
+/** Problems that mean the task did not really finish, even if the agent exited cleanly. */
+async function unfinishedWork(w: Workdir): Promise<string[]> {
+  if (!w.branch) return [];
+  const problems: string[] = [];
+  const dirty = (await git(w.dir, "status", "--porcelain")).stdout.trim();
+  if (dirty) problems.push(`uncommitted changes were left in ${w.dir}`);
+  const head = (await git(w.dir, "rev-parse", "HEAD")).stdout.trim();
+  if (head && head !== w.baseSha) {
+    const remote = (await git(w.dir, "ls-remote", "origin", `refs/heads/${w.branch}`)).stdout.split(/\s/)[0];
+    if (remote !== head) problems.push(`commits on ${w.branch} were not pushed`);
+  }
+  return problems;
 }
 
 function buildPrompt(h: Handoff, note: string, resuming: boolean): string {
@@ -101,7 +145,7 @@ function buildPrompt(h: Handoff, note: string, resuming: boolean): string {
     note,
     h.context ? `## Context from ${h.from_agent}\n${h.context}` : "",
     ...followUps.map((m) => `## Follow-up from ${m.author}\n${m.body}`),
-    `Work autonomously. Commit and push to the branch (open a PR if it fits). Finish with a short summary of what you did, what is left, and any PR URL: it is sent back to ${h.from_agent}.`,
+    `Work autonomously: nobody can approve anything for you. Commit and push your changes (open a PR if it fits). Finish with a short summary of what you did, what is left, and any PR URL: it is sent back to ${h.from_agent}.`,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -109,32 +153,36 @@ async function runClaude(h: Handoff, dir: string, prompt: string) {
   const args = ["-p", prompt, "--output-format", "json", ...CLAUDE_ARGS];
   if (h.agent_session_id) args.push("--resume", h.agent_session_id);
   const r = await run(CLAUDE_BIN, args, dir);
-  let parsed: { result?: string; session_id?: string; is_error?: boolean } = {};
+  let parsed: { result?: string; session_id?: string; is_error?: boolean; permission_denials?: { tool_name: string; tool_input?: Record<string, unknown> }[] } = {};
   try { parsed = JSON.parse(r.stdout.trim().split("\n").filter(Boolean).at(-1) ?? "{}"); } catch { /* not JSON */ }
   const text = parsed.result ?? (r.stdout || r.stderr).trim();
-  return { ok: r.code === 0 && !parsed.is_error, text, sessionId: parsed.session_id, raw: `${r.stdout}\n${r.stderr}` };
+  const denials = (parsed.permission_denials ?? []).map((d) => {
+    const input = d.tool_input?.command ?? d.tool_input?.file_path ?? "";
+    return `${d.tool_name}${input ? `: ${String(input).slice(0, 80)}` : ""}`;
+  });
+  return { ok: r.code === 0 && !parsed.is_error, text, sessionId: parsed.session_id, raw: `${r.stdout}\n${r.stderr}`, denials };
 }
 
 async function runCodex(_h: Handoff, dir: string, prompt: string) {
   const out = path.join(mkdtempSync(path.join(os.tmpdir(), "handoff-")), "last.txt");
-  const r = await run(CODEX_BIN, ["exec", "--skip-git-repo-check", "--output-last-message", out, prompt], dir);
+  const r = await run(CODEX_BIN, ["exec", "--skip-git-repo-check", ...CODEX_ARGS, "--output-last-message", out, prompt], dir);
   const text = existsSync(out) ? readFileSync(out, "utf8").trim() : (r.stdout || r.stderr).trim();
-  return { ok: r.code === 0, text, sessionId: undefined as string | undefined, raw: `${r.stdout}\n${r.stderr}` };
+  return { ok: r.code === 0, text, sessionId: undefined as string | undefined, raw: `${r.stdout}\n${r.stderr}`, denials: [] as string[] };
 }
 
 async function handle(h: Handoff) {
   log(`claimed ${h.id} -> ${h.to_agent}: ${h.title}`);
   const agent = h.to_agent;
-  let dir: string, note: string;
+  let w: Workdir;
   try {
-    ({ dir, note } = await prepareWorkdir(h));
+    w = await prepareWorkdir(h);
   } catch (e) {
     await api("POST", `/api/handoffs/${h.id}/complete`, { agent, status: "failed", result: `Runner could not prepare the repo: ${(e as Error).message}` });
     return;
   }
-  await api("POST", `/api/handoffs/${h.id}/progress`, { agent, note: `${agent} started on ${RUNNER_ID} in ${dir}` });
-  const prompt = buildPrompt(h, note, Boolean(h.agent_session_id));
-  const r = agent === "codex" ? await runCodex(h, dir, prompt) : await runClaude(h, dir, prompt);
+  await api("POST", `/api/handoffs/${h.id}/progress`, { agent, note: `${agent} started on ${RUNNER_ID} in ${w.dir}${w.branch ? ` (branch ${w.branch})` : ""}` });
+  const prompt = buildPrompt(h, w.note, Boolean(h.agent_session_id));
+  const r = agent === "codex" ? await runCodex(h, w.dir, prompt) : await runClaude(h, w.dir, prompt);
 
   if (!r.ok && LIMIT_RE.test(r.raw)) {
     limitedUntil = Date.now() + LIMIT_COOLDOWN_MS;
@@ -147,14 +195,20 @@ async function handle(h: Handoff) {
     await heartbeat();
     return;
   }
+  const problems = [
+    ...(r.denials.length ? [`${r.denials.length} tool call(s) needed an approval nobody could give (${r.denials.slice(0, 5).join("; ")})`] : []),
+    ...(await unfinishedWork(w)),
+  ];
+  const ok = r.ok && problems.length === 0;
+  const text = r.text || "(no output)";
   await api("POST", `/api/handoffs/${h.id}/complete`, {
     agent,
-    status: r.ok ? "done" : "failed",
-    result: r.text || "(no output)",
+    status: ok ? "done" : "failed",
+    result: problems.length ? `Blocked on ${RUNNER_ID}: ${problems.join("; ")}.\n\n${text}` : text,
     pr_url: r.text.match(PR_RE)?.[0],
     agent_session_id: r.sessionId,
   });
-  log(`${h.id} ${r.ok ? "done" : "failed"}`);
+  log(`${h.id} ${ok ? "done" : "failed"}${problems.length ? `: ${problems.join("; ")}` : ""}`);
 }
 
 async function heartbeat() {

@@ -2,8 +2,8 @@
  * End-to-end test: real hub + Postgres, mock Devin API, real runner with a fake `claude` binary.
  * Needs TEST_DATABASE_URL (a throwaway database).
  */
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -118,6 +118,36 @@ async function main() {
   assert.equal(s.claude_available, false); assert.ok(s.runners[0].usage_limited_until);
   assert.equal((await devinMcp("handoff_create", { to: "auto", title: "auto2", prompt: "x" })).to, "devin");
   console.log("ok 5 usage limit reroutes to Devin; auto picks claude when online, devin when limited");
+
+  // 7. Repo handoffs run in their own worktree + branch; the owner's dirty checkout is left alone
+  await db.query("UPDATE runners SET limited_until = NULL");
+  const sh = (cwd: string, ...a: string[]) => execFileSync("git", a, { cwd, encoding: "utf8" }).trim();
+  const origin = path.join(tmp, "origin.git"), local = path.join(tmp, "local");
+  sh(tmp, "init", "-q", "--bare", "-b", "main", origin);
+  sh(tmp, "clone", "-q", origin, local);
+  writeFileSync(path.join(local, "README"), "hi\n");
+  sh(local, "add", "README"); sh(local, "commit", "-qm", "init"); sh(local, "push", "-q", "origin", "main");
+  writeFileSync(path.join(local, "README"), "owner's uncommitted edit\n");
+  const gitEnv = { HANDOFF_REPOS: JSON.stringify({ "Quillhash/demo": local }), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  const e = await devinMcp("handoff_create", { to: "claude", title: "Fix", prompt: "SIMULATE_COMMIT fix it", repo: "Quillhash/demo" });
+  await runner(gitEnv);
+  const eDone = await devinMcp("handoff_get", { id: e.id });
+  assert.equal(eDone.status, "done", eDone.result); assert.equal(eDone.pr_url, "https://github.com/Quillhash/demo/pull/8");
+  assert.ok(sh(origin, "rev-parse", "--verify", `refs/heads/handoff/${e.id}`), "branch pushed");
+  assert.equal(sh(local, "rev-parse", "--abbrev-ref", "HEAD"), "main");
+  assert.match(sh(local, "status", "--porcelain"), /README/);
+  assert.match(readFileSync(fakeLog, "utf8"), /mode=bypassPermissions/);
+  console.log("ok 6 repo handoff ran in its own worktree, pushed handoff/<id>, owner's checkout untouched");
+
+  // 8. A run blocked on approvals (uncommitted work, denied tool calls) reports failed
+  const f = await devinMcp("handoff_create", { to: "claude", title: "Fix", prompt: "SIMULATE_DENIAL fix it", repo: "Quillhash/demo", devin_session_id: "blocked1" });
+  await runner(gitEnv);
+  const fDone = await devinMcp("handoff_get", { id: f.id });
+  assert.equal(fDone.status, "failed");
+  assert.match(fDone.result, /needed an approval nobody could give \(Bash: git commit -am fix\)/);
+  assert.match(fDone.result, /uncommitted changes were left/);
+  assert.match(devin.sent.find((m) => m.session === "devin-blocked1")!.message, /is failed by claude/);
+  console.log("ok 7 blocked run (denied tool calls, uncommitted changes) is reported as failed");
 
   await db.end();
   console.log("all e2e checks passed");
