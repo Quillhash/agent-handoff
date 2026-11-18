@@ -39,7 +39,7 @@ The hub runs at `https://agent-handoff-hub-production.up.railway.app` (Railway p
 Needs Node 20.12+, `git`, `claude` signed in, and Railway access to QuillAudits Services: either the [Railway CLI](https://docs.railway.com/guides/cli) signed in, or `RAILWAY_API_TOKEN` set to an account/workspace token.
 
 ```bash
-git clone https://github.com/Quillhash/agent-handoff-mcp && cd agent-handoff-mcp
+git clone https://github.com/Quillhash/agent-handoff && cd agent-handoff
 npm install                 # also builds dist/
 railway login               # skip if RAILWAY_API_TOKEN is set
 npm run setup               # adds the "agent-handoff" MCP to Claude Code (user scope)
